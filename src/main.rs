@@ -3,9 +3,12 @@
 
 use defmt::info;
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_stm32::time::Hertz;
-use embassy_stm32::Config;
+use embassy_stm32::{
+    gpio::{Level, Output, Pin, Speed},
+    peripherals::PC5,
+    time::Hertz,
+    Config,
+};
 use embassy_time::{Instant, Timer};
 use {defmt_rtt as _, panic_probe as _};
 
@@ -36,23 +39,23 @@ async fn main(_spawner: Spawner) {
         config.rcc.ls.lsi = true;
         config.rcc.ls.lse = None;
         config.rcc.sys = Sysclk::PLL1_P;
-        config.rcc.mux.clk48sel = mux::Clk48sel::PLL1_Q;
     }
     let p = embassy_stm32::init(config);
 
     let mut led = Output::new(p.PC5, Level::High, Speed::Low);
 
     loop {
-        fib_test::<u32>(34, &mut led).await;
-        fib_test::<u64>(34, &mut led).await;
-        fib_test::<f32>(32, &mut led).await;
-        fib_test::<f64>(32, &mut led).await;
+        fib_test::<u32, PC5>(34, &mut led).await;
+        fib_test::<u64, PC5>(34, &mut led).await;
+        fib_test::<f32, PC5>(32, &mut led).await;
+        fib_test::<f64, PC5>(32, &mut led).await;
     }
 }
 
-async fn fib_test<'d, T>(n: usize, led: &mut Output<'d>)
+async fn fib_test<'d, T, P>(n: usize, led: &mut Output<'d, P>)
 where
     T: core::ops::Add<T, Output = T> + From<u8>,
+    P: Pin,
 {
     // Light LED for one second
     led.set_low();
