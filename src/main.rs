@@ -4,8 +4,7 @@
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_stm32::{
-    gpio::{Level, Output, Pin, Speed},
-    peripherals::PC5,
+    gpio::{Level, Output, Speed},
     time::Hertz,
     Config,
 };
@@ -45,17 +44,16 @@ async fn main(_spawner: Spawner) {
     let mut led = Output::new(p.PC5, Level::High, Speed::Low);
 
     loop {
-        fib_test::<u32, PC5>(34, &mut led).await;
-        fib_test::<u64, PC5>(34, &mut led).await;
-        fib_test::<f32, PC5>(32, &mut led).await;
-        fib_test::<f64, PC5>(32, &mut led).await;
+        fib_test::<u32>(34, &mut led).await;
+        fib_test::<u64>(34, &mut led).await;
+        fib_test::<f32>(32, &mut led).await;
+        fib_test::<f64>(32, &mut led).await;
     }
 }
 
-async fn fib_test<'d, T, P>(n: usize, led: &mut Output<'d, P>)
+async fn fib_test<'d, T>(n: usize, led: &mut Output<'d>)
 where
     T: core::ops::Add<T, Output = T> + From<u8>,
-    P: Pin,
 {
     // Light LED for one second
     led.set_low();
