@@ -5,7 +5,8 @@ use defmt::info;
 use embassy_executor::Spawner;
 use embassy_stm32::{
     gpio::{Level, Output, Speed},
-    spi::Spi,
+    mode::Mode,
+    spi::{self, Spi},
     time::Hertz,
     Config,
 };
@@ -44,48 +45,244 @@ async fn main(_spawner: Spawner) {
     // Configure the LED
     let mut led = Output::new(p.PC5, Level::High, Speed::Low);
 
-    // Configure SPI1
+    // Configure the screen
     let spi1 = {
-        use embassy_stm32::spi::{Config, Spi};
-        let mut config = Config::default(); // TODO
+        use embassy_stm32::spi::*;
+        let mut config = Config::default();
+        config.mode.polarity = Polarity::IdleLow;
+        config.mode.phase = Phase::CaptureOnFirstTransition;
+        config.bit_order = BitOrder::MsbFirst;
 
         Spi::new_txonly(
-            p.SPI1, // SPI peripheral
-            p.PA5,  // Clock pin
-            p.PA7,  // MOSI pin
+            p.SPI1,     // SPI peripheral
+            p.PA5,      // Clock pin
+            p.PA7,      // MOSI pin
+            p.DMA2_CH3, // DMA peripheral
             config,
         )
     };
 
-    let mut screen = Screen {
-        spi: spi1,
-        cs: p.PC14,
-        dc: p.PC13,
-        rst: p.PB9,
-        bl: p.PB8,
+    let mut screen = {
+        let cs = Output::new(p.PC14, Level::Low, Speed::Low);
+        let rst = Output::new(p.PB9, Level::Low, Speed::Low);
+        let dc = Output::new(p.PC13, Level::Low, Speed::Low);
+        let bl = Output::new(p.PB8, Level::Low, Speed::Low);
+        Screen::new(spi1, cs, rst, dc, bl).await.unwrap()
     };
+
+    screen.set_orientation(Orientation::Portrait).unwrap();
 
     // Do stuff
     loop {
+        led.set_low();
+        screen.disable_backlight();
+        Timer::after_secs(1).await;
+
+        led.set_high();
+        screen.enable_backlight();
+        Timer::after_secs(1).await;
+
+        /*
         fib_test::<u32>(34, &mut led).await;
         fib_test::<u64>(34, &mut led).await;
         fib_test::<f32>(32, &mut led).await;
         fib_test::<f64>(32, &mut led).await;
+        */
     }
 }
 
-struct Screen<CS, DC, RST, BL>
+struct Screen<'d, M>
 where
-    CS: Pin,  // C 14
-    DC: Pin,  // C 13
-    RST: Pin, // B 9
-    BL: Pin,  // B 8
+    M: Mode,
 {
-    spi: Spi,
-    cs: CS,
-    dc: DC,
-    rst: RST,
-    bl: BL,
+    spi: Spi<'d, M>,
+    cs: Output<'d>,
+    rst: Output<'d>,
+    dc: Output<'d>,
+    bl: Output<'d>,
+}
+
+impl<'d, M> Screen<'d, M>
+where
+    M: Mode,
+{
+    async fn new(
+        spi: Spi<'d, M>,
+        cs: Output<'d>,
+        rst: Output<'d>,
+        dc: Output<'d>,
+        bl: Output<'d>,
+    ) -> Result<Self, spi::Error> {
+        const STARTUP_SEQUENCE: &[(u8, &[u8])] = &[
+            (POWER_CONTROL_A, &[0x39, 0x2C, 0x00, 0x34, 0x02]),
+            (POWER_CONTROL_B, &[0x00, 0xC1, 0x30]),
+            (TIMER_CONTROL_A, &[0x85, 0x00, 0x78]),
+            (TIMER_CONTROL_B, &[0x00, 0x00]),
+            (POWER_ON_SEQUENCE_CONTROL, &[0x64, 0x03, 0x12, 0x81]),
+            (PUMP_RATIO_COMMAND, &[0x20]),
+            (POWER_CONTROL_VRH, &[0x23]),
+            (POWER_CONTROL_SAP_BT, &[0x10]),
+            (VCM_CONTROL_1, &[0x3E, 0x28]),
+            (VCM_CONTROL_2, &[0x86]),
+            (MEMORY_ACCESS_CONTROL, &[0x48]),
+            (PIXEL_FORMAT, &[0x55]),
+            (FRAME_RATIO_CONTROL, &[0x00, 0x18]),
+            (DISPLAY_FUNCTION_CONTROL, &[0x08, 0x82, 0x27]),
+            (GAMMA_FUNCTION_DISPLAY, &[0x00]),
+            (GAMMA_CURVE_SELECTED, &[0x01]),
+            (
+                POSITIVE_GAMMA_CORRECTION,
+                &[
+                    0x0F, 0x31, 0x2B, 0x0C, 0x0E, 0x08, 0x4E, 0xF1, 0x37, 0x07, 0x10, 0x03, 0x0E,
+                    0x09, 0x00,
+                ],
+            ),
+            (
+                NEGATIVE_GAMMA_CORRECTION,
+                &[
+                    0x00, 0x0E, 0x14, 0x03, 0x11, 0x07, 0x31, 0xC1, 0x48, 0x08, 0x0F, 0x0C, 0x31,
+                    0x36, 0x0F,
+                ],
+            ),
+        ];
+
+        let mut screen = Self {
+            spi,
+            cs,
+            rst,
+            dc,
+            bl,
+        };
+
+        screen.deselect();
+        screen.select();
+        screen.reset().await;
+
+        screen.write_command(SOFTWARE_RESET)?;
+        Timer::after_millis(5).await;
+
+        for (command, data) in STARTUP_SEQUENCE {
+            screen.write_command(*command)?;
+            screen.write_data(*data)?;
+        }
+
+        screen.write_command(EXIT_SLEEP)?;
+
+        Timer::after_millis(50).await;
+
+        screen.write_command(DISPLAY_ON)?;
+        screen.deselect();
+
+        Ok(screen)
+    }
+
+    fn deselect(&mut self) {
+        self.cs.set_low();
+    }
+
+    fn select(&mut self) {
+        self.cs.set_high();
+    }
+
+    async fn reset(&mut self) {
+        self.rst.set_low();
+        Timer::after_millis(50).await;
+        self.rst.set_high();
+    }
+
+    fn write_command(&mut self, command: u8) -> Result<(), spi::Error> {
+        self.dc.set_low();
+        self.spi.blocking_write(&[command])
+    }
+
+    // XXX(RLB) Note select needs to be called prior and deselect following
+    fn write_data(&mut self, mut data: &[u8]) -> Result<(), spi::Error> {
+        const MAX_CHUNK_SIZE: usize = 1 << 15;
+        self.dc.set_high();
+        while !data.is_empty() {
+            let chunk_size = if data.len() > MAX_CHUNK_SIZE {
+                MAX_CHUNK_SIZE
+            } else {
+                data.len()
+            };
+            self.spi.blocking_write(&data[..chunk_size])?;
+            data = &data[chunk_size..];
+        }
+
+        Ok(())
+    }
+
+    fn set_orientation(&mut self, orientation: Orientation) -> Result<(), spi::Error> {
+        // TODO(RLB) set local view_width, view_height
+        self.write_command(ROTATION_CONTROL)?;
+        self.write_data(&[u8::from(orientation)])?;
+        Ok(())
+    }
+
+    fn disable_backlight(&mut self) {
+        self.bl.set_low();
+    }
+
+    fn enable_backlight(&mut self) {
+        self.bl.set_high();
+    }
+}
+
+// TODO(RLB) Change this into an enum?
+// TODO(RLB) What is the right size for these?
+const SOFTWARE_RESET: u8 = 0x01;
+const POWER_CONTROL_A: u8 = 0xCB;
+const POWER_CONTROL_B: u8 = 0xCF;
+const TIMER_CONTROL_A: u8 = 0xE8;
+const TIMER_CONTROL_B: u8 = 0xEA;
+const POWER_ON_SEQUENCE_CONTROL: u8 = 0xED;
+const PUMP_RATIO_COMMAND: u8 = 0xF7;
+const POWER_CONTROL_VRH: u8 = 0xC0;
+const POWER_CONTROL_SAP_BT: u8 = 0xC1;
+const VCM_CONTROL_1: u8 = 0xC5;
+const VCM_CONTROL_2: u8 = 0xC7;
+const MEMORY_ACCESS_CONTROL: u8 = 0x36;
+const PIXEL_FORMAT: u8 = 0x3A;
+const FRAME_RATIO_CONTROL: u8 = 0xB1;
+const DISPLAY_FUNCTION_CONTROL: u8 = 0xB6;
+const GAMMA_FUNCTION_DISPLAY: u8 = 0xF2;
+const GAMMA_CURVE_SELECTED: u8 = 0x26;
+const POSITIVE_GAMMA_CORRECTION: u8 = 0xE0;
+const NEGATIVE_GAMMA_CORRECTION: u8 = 0xE1;
+const EXIT_SLEEP: u8 = 0x11;
+const DISPLAY_ON: u8 = 0x29;
+const ROTATION_CONTROL: u8 = 0x36;
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Orientation {
+    Portrait,
+    FlippedPortrait,
+    LeftLandscape,
+    RightLandscape,
+}
+
+impl Orientation {
+    // XXX(RLB) These values need more descriptive names
+    const MY: u8 = 0x80;
+    const MX: u8 = 0x40;
+    const MV: u8 = 0x20;
+    const BGR: u8 = 0x08;
+
+    const PORTRAIT_MODE: u8 = Self::MY | Self::BGR;
+    const FLIPPED_PORTRAIT_MODE: u8 = Self::MX | Self::BGR;
+    const LEFT_LANDSCAPE_MODE: u8 = Self::MV | Self::BGR;
+    const RIGHT_LANDSCAPE_MODE: u8 = Self::MX | Self::MY | Self::MV | Self::BGR;
+}
+
+impl From<Orientation> for u8 {
+    fn from(orientation: Orientation) -> u8 {
+        match orientation {
+            Orientation::Portrait => Orientation::PORTRAIT_MODE,
+            Orientation::FlippedPortrait => Orientation::FLIPPED_PORTRAIT_MODE,
+            Orientation::LeftLandscape => Orientation::LEFT_LANDSCAPE_MODE,
+            Orientation::RightLandscape => Orientation::RIGHT_LANDSCAPE_MODE,
+        }
+    }
 }
 
 async fn fib_test<'d, T>(n: usize, led: &mut Output<'d>)
@@ -120,69 +317,3 @@ where
         1_u8.into()
     }
 }
-
-/*
-
-// stm32f4xx_hal_msp.c
-/**
-* @brief SPI MSP Initialization
-* This function configures the hardware resources used in this example
-* @param hspi: SPI handle pointer
-* @retval None
-*/
-void HAL_SPI_MspInit(SPI_HandleTypeDef* hspi)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  if(hspi->Instance==SPI1)
-  {
-  /* USER CODE BEGIN SPI1_MspInit 0 */
-
-  /* USER CODE END SPI1_MspInit 0 */
-    /* Peripheral clock enable */
-    __HAL_RCC_SPI1_CLK_ENABLE();
-
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-    /**SPI1 GPIO Configuration
-    PA5     ------> SPI1_SCK
-    PA7     ------> SPI1_MOSI
-    */
-    GPIO_InitStruct.Pin = SPI1_CLK_Pin|SPI1_MOSI_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-    GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-    /* SPI1 DMA Init */
-    /* SPI1_TX Init */
-    hdma_spi1_tx.Instance = DMA2_Stream3;
-    hdma_spi1_tx.Init.Channel = DMA_CHANNEL_3;
-    hdma_spi1_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
-    hdma_spi1_tx.Init.PeriphInc = DMA_PINC_DISABLE;
-    hdma_spi1_tx.Init.MemInc = DMA_MINC_ENABLE;
-    hdma_spi1_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
-    hdma_spi1_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
-    hdma_spi1_tx.Init.Mode = DMA_NORMAL;
-    hdma_spi1_tx.Init.Priority = DMA_PRIORITY_LOW;
-    hdma_spi1_tx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
-    if (HAL_DMA_Init(&hdma_spi1_tx) != HAL_OK)
-    {
-      Error_Handler();
-    }
-
-    __HAL_LINKDMA(hspi,hdmatx,hdma_spi1_tx);
-
-    /* SPI1 interrupt Init */
-    HAL_NVIC_SetPriority(SPI1_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(SPI1_IRQn);
-  /* USER CODE BEGIN SPI1_MspInit 1 */
-
-  /* USER CODE END SPI1_MspInit 1 */
-  }
-
-}
-
-
-
-
-*/
