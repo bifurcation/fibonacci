@@ -5,7 +5,7 @@ use defmt::info;
 use embassy_executor::Spawner;
 use embassy_stm32::{
     gpio::{Level, Output, Speed},
-    mode::Mode,
+    mode::Async,
     spi::{self, Spi},
     time::Hertz,
     Config,
@@ -91,23 +91,20 @@ async fn main(_spawner: Spawner) {
     }
 }
 
-struct Screen<'d, M>
-where
-    M: Mode,
-{
-    spi: Spi<'d, M>,
+struct Screen<'d> {
+    spi: Spi<'d, Async>,
     cs: Output<'d>,
     rst: Output<'d>,
     dc: Output<'d>,
     bl: Output<'d>,
+
+    view_width: u16,
+    view_height: u16,
 }
 
-impl<'d, M> Screen<'d, M>
-where
-    M: Mode,
-{
+impl<'d> Screen<'d> {
     async fn new(
-        spi: Spi<'d, M>,
+        spi: Spi<'d, Async>,
         cs: Output<'d>,
         rst: Output<'d>,
         dc: Output<'d>,
@@ -152,6 +149,8 @@ where
             rst,
             dc,
             bl,
+            view_width: 0,
+            view_height: 0,
         };
 
         screen.deselect();
@@ -213,9 +212,10 @@ where
     }
 
     fn set_orientation(&mut self, orientation: Orientation) -> Result<(), spi::Error> {
-        // TODO(RLB) set local view_width, view_height
         self.write_command(ROTATION_CONTROL)?;
         self.write_data(&[u8::from(orientation)])?;
+        self.view_width = orientation.width();
+        self.view_height = orientation.height();
         Ok(())
     }
 
@@ -225,6 +225,103 @@ where
 
     fn enable_backlight(&mut self) {
         self.bl.set_high();
+    }
+
+    /*
+    fn fill_screen(&mut self, color: u16) -> Result<(), spi::Error> {
+        self.fill_rectangle_blocking(0, 0, self.view_width, self.view_height, color);
+    }
+
+    fn fill_rectangle_blocking(&mut self, x0: u16, y0: u16, x1: u16, y1: u16, color: u16) {
+        if x0 >= self.view_width || y0 >= self.view_height || x1 <= x0 || y1 <= y0 {
+            // TODO(RLB) make this fallible
+            unreachable!();
+        }
+
+        let x1 = core::cmp::max(x0, x1);
+        let y1 = core::cmp::max(y0, y1);
+
+        self.wait_until_spi_free().await; // TODO
+
+        self.select();
+        self.set_writable_pixels(x0, y0, x1 - 1, y1 - 1);
+
+        let width = x1 - x0;
+        let height = y1 - y0;
+        let total_pixel_bytes = (width as u32) * (height as u32) * 2;
+
+        todo!(); // TODO(RLB) continue
+    }
+    */
+
+    // TODO(RLB) Have a nicer interface than u16 for pixels, something like `struct
+    // PixelBuffer<'a>(&'a [u16])`.
+    async fn update_area(
+        &mut self,
+        x0: u16,
+        y0: u16,
+        x1: u16,
+        y1: u16,
+        pixels: &[u16],
+    ) -> Result<(), spi::Error> {
+        if x0 >= self.view_width || y0 >= self.view_height || x1 <= x0 || y1 <= y0 {
+            // TODO(RLB) make this fallible
+            unreachable!();
+        }
+
+        let x1 = core::cmp::max(x0, x1);
+        let y1 = core::cmp::max(y0, y1);
+
+        let width = x1 - x0;
+        let height = y1 - y0;
+        let total_pixels = (width as usize) * (height as usize);
+        if pixels.len() != total_pixels {
+            // TODO(RLB) fail
+            unreachable!();
+        }
+
+        let col_data: [u8; 4] = [
+            (x0 >> 8) as u8,
+            (x0 & 0xff) as u8,
+            (x1 >> 8) as u8,
+            (x1 & 0xff) as u8,
+        ];
+        let row_data: [u8; 4] = [
+            (y0 >> 8) as u8,
+            (y0 & 0xff) as u8,
+            (y1 >> 8) as u8,
+            (y1 & 0xff) as u8,
+        ];
+
+        // XXX(RLB) Create a stack-allocated buffer on the fly
+        let mut pixel_data = pixels
+            .iter()
+            .map(|b| b.to_be_bytes())
+            .flatten()
+            .chain(core::iter::repeat(0));
+
+        let pixel_buffer: [u8; 240 * 320] = core::array::from_fn(|_| pixel_data.next().unwrap());
+        let pixel_buffer = &pixel_buffer[..(2 * total_pixels)];
+
+        self.select();
+
+        // Set the writable area
+        self.write_command(COLUMN_ADDRESS_SET)?;
+        self.write_data(&col_data)?;
+
+        self.write_command(ROW_ADDRESS_SET)?;
+        self.write_data(&row_data)?;
+
+        self.write_command(WRITE_TO_RAM)?;
+
+        // Tell the ILI9341 that we are going to send data next
+        self.dc.set_high();
+
+        // Write the pixel data
+        // XXX(RLB) Technically this will accept &[16]; maybe we can avoid the above conversion?
+        self.spi.write(&pixel_buffer).await?;
+
+        Ok(())
     }
 }
 
@@ -252,6 +349,9 @@ const NEGATIVE_GAMMA_CORRECTION: u8 = 0xE1;
 const EXIT_SLEEP: u8 = 0x11;
 const DISPLAY_ON: u8 = 0x29;
 const ROTATION_CONTROL: u8 = 0x36;
+const COLUMN_ADDRESS_SET: u8 = 0x2a;
+const ROW_ADDRESS_SET: u8 = 0x2b;
+const WRITE_TO_RAM: u8 = 0x2c;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum Orientation {
@@ -262,6 +362,9 @@ enum Orientation {
 }
 
 impl Orientation {
+    const WIDTH: u16 = 240;
+    const HEIGHT: u16 = 320;
+
     // XXX(RLB) These values need more descriptive names
     const MY: u8 = 0x80;
     const MX: u8 = 0x40;
@@ -272,6 +375,20 @@ impl Orientation {
     const FLIPPED_PORTRAIT_MODE: u8 = Self::MX | Self::BGR;
     const LEFT_LANDSCAPE_MODE: u8 = Self::MV | Self::BGR;
     const RIGHT_LANDSCAPE_MODE: u8 = Self::MX | Self::MY | Self::MV | Self::BGR;
+
+    fn width(&self) -> u16 {
+        match *self {
+            Orientation::Portrait | Orientation::FlippedPortrait => Self::WIDTH,
+            Orientation::LeftLandscape | Orientation::RightLandscape => Self::HEIGHT,
+        }
+    }
+
+    fn height(&self) -> u16 {
+        match *self {
+            Orientation::Portrait | Orientation::FlippedPortrait => Self::WIDTH,
+            Orientation::LeftLandscape | Orientation::RightLandscape => Self::HEIGHT,
+        }
+    }
 }
 
 impl From<Orientation> for u8 {
