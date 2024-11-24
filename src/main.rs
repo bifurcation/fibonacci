@@ -15,6 +15,8 @@ use {defmt_rtt as _, panic_probe as _};
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
+    info!("hello!");
+
     // Configure the device and get a handle to its capabilities
     let mut config = Config::default();
     {
@@ -67,13 +69,48 @@ async fn main(_spawner: Spawner) {
         let rst = Output::new(p.PB9, Level::Low, Speed::Low);
         let dc = Output::new(p.PC13, Level::Low, Speed::Low);
         let bl = Output::new(p.PB8, Level::Low, Speed::Low);
+        info!("initializing screen");
         Screen::new(spi1, cs, rst, dc, bl).await.unwrap()
     };
+    info!("done");
 
     screen.set_orientation(Orientation::Portrait).unwrap();
 
     // Do stuff
+    const X: usize = 10;
+    const Y: usize = 10;
+    const WIDTH: usize = 50;
+    const HEIGHT: usize = 50;
+    let mut color = 0_u16;
+    let mut pixel_buf = [0_u16; WIDTH * HEIGHT];
+
+    screen.enable_backlight();
     loop {
+        info!("main loop");
+        led.set_low();
+        color = (color + 1) % 0x0fff;
+        pixel_buf.fill(color);
+        info!("drawing to screen");
+        screen
+            .update_area(X, Y, X + WIDTH, Y + HEIGHT, &pixel_buf)
+            .await
+            .unwrap();
+        Timer::after_millis(50).await;
+
+        info!("second half");
+        led.set_high();
+        /*
+        color = (color + 1) % 0x0fff;
+        pixel_buf.fill(color);
+        info!("drawing to screen");
+        screen
+            .update_area(X, Y, X + WIDTH, Y + HEIGHT, &pixel_buf)
+            .await
+            .unwrap();
+        */
+        Timer::after_millis(50).await;
+
+        /*
         led.set_low();
         screen.disable_backlight();
         Timer::after_secs(1).await;
@@ -81,6 +118,7 @@ async fn main(_spawner: Spawner) {
         led.set_high();
         screen.enable_backlight();
         Timer::after_secs(1).await;
+        */
 
         /*
         fib_test::<u32>(34, &mut led).await;
@@ -98,8 +136,8 @@ struct Screen<'d> {
     dc: Output<'d>,
     bl: Output<'d>,
 
-    view_width: u16,
-    view_height: u16,
+    view_width: usize,
+    view_height: usize,
 }
 
 impl<'d> Screen<'d> {
@@ -258,25 +296,33 @@ impl<'d> Screen<'d> {
     // PixelBuffer<'a>(&'a [u16])`.
     async fn update_area(
         &mut self,
-        x0: u16,
-        y0: u16,
-        x1: u16,
-        y1: u16,
+        x0: usize,
+        y0: usize,
+        x1: usize,
+        y1: usize,
         pixels: &[u16],
     ) -> Result<(), spi::Error> {
         if x0 >= self.view_width || y0 >= self.view_height || x1 <= x0 || y1 <= y0 {
             // TODO(RLB) make this fallible
+            info!("nonsensical dimensions");
             unreachable!();
         }
 
-        let x1 = core::cmp::max(x0, x1);
-        let y1 = core::cmp::max(y0, y1);
+        let x1 = core::cmp::min(x1, self.view_width);
+        let y1 = core::cmp::min(y1, self.view_height);
 
         let width = x1 - x0;
         let height = y1 - y0;
         let total_pixels = (width as usize) * (height as usize);
         if pixels.len() != total_pixels {
             // TODO(RLB) fail
+            info!(
+                "incorrect pixel buffer size {} != {} = {} * {}",
+                pixels.len(),
+                total_pixels,
+                width,
+                height,
+            );
             unreachable!();
         }
 
@@ -294,14 +340,14 @@ impl<'d> Screen<'d> {
         ];
 
         // XXX(RLB) Create a stack-allocated buffer on the fly
-        let mut pixel_data = pixels
-            .iter()
-            .map(|b| b.to_be_bytes())
-            .flatten()
-            .chain(core::iter::repeat(0));
+        let mut pixel_buffer = [0_u8; 240 * 320];
+        for (i, b) in pixels.iter().map(|b| b.to_be_bytes()).flatten().enumerate() {
+            pixel_buffer[i] = b;
+        }
 
-        let pixel_buffer: [u8; 240 * 320] = core::array::from_fn(|_| pixel_data.next().unwrap());
-        let pixel_buffer = &pixel_buffer[..(2 * total_pixels)];
+        let mut pixel_buffer = &pixel_buffer[..(2 * total_pixels)];
+
+        const MAX_CHUNK_SIZE: usize = 1024;
 
         self.select();
 
@@ -319,7 +365,15 @@ impl<'d> Screen<'d> {
 
         // Write the pixel data
         // XXX(RLB) Technically this will accept &[16]; maybe we can avoid the above conversion?
-        self.spi.write(&pixel_buffer).await?;
+        while !pixel_buffer.is_empty() {
+            let chunk_size = core::cmp::min(pixel_buffer.len(), MAX_CHUNK_SIZE);
+            let (chunk, rest) = pixel_buffer.split_at(chunk_size);
+            pixel_buffer = rest;
+            // XXX(RLB) This line causes a hang and even breaks the debug probe
+            self.spi.blocking_write(chunk)?;
+        }
+
+        self.deselect();
 
         Ok(())
     }
@@ -362,8 +416,8 @@ enum Orientation {
 }
 
 impl Orientation {
-    const WIDTH: u16 = 240;
-    const HEIGHT: u16 = 320;
+    const WIDTH: usize = 240;
+    const HEIGHT: usize = 320;
 
     // XXX(RLB) These values need more descriptive names
     const MY: u8 = 0x80;
@@ -376,14 +430,14 @@ impl Orientation {
     const LEFT_LANDSCAPE_MODE: u8 = Self::MV | Self::BGR;
     const RIGHT_LANDSCAPE_MODE: u8 = Self::MX | Self::MY | Self::MV | Self::BGR;
 
-    fn width(&self) -> u16 {
+    fn width(&self) -> usize {
         match *self {
             Orientation::Portrait | Orientation::FlippedPortrait => Self::WIDTH,
             Orientation::LeftLandscape | Orientation::RightLandscape => Self::HEIGHT,
         }
     }
 
-    fn height(&self) -> u16 {
+    fn height(&self) -> usize {
         match *self {
             Orientation::Portrait | Orientation::FlippedPortrait => Self::WIDTH,
             Orientation::LeftLandscape | Orientation::RightLandscape => Self::HEIGHT,
