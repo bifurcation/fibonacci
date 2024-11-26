@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(dead_code)]
 
 use defmt::info;
 use embassy_executor::Spawner;
@@ -15,8 +16,6 @@ use {defmt_rtt as _, panic_probe as _};
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    info!("hello!");
-
     // Configure the device and get a handle to its capabilities
     let mut config = Config::default();
     {
@@ -54,6 +53,7 @@ async fn main(_spawner: Spawner) {
         config.mode.polarity = Polarity::IdleLow;
         config.mode.phase = Phase::CaptureOnFirstTransition;
         config.bit_order = BitOrder::MsbFirst;
+        config.frequency = Hertz(42_000_000);
 
         Spi::new_txonly(
             p.SPI1,     // SPI peripheral
@@ -69,46 +69,33 @@ async fn main(_spawner: Spawner) {
         let rst = Output::new(p.PB9, Level::Low, Speed::Low);
         let dc = Output::new(p.PC13, Level::Low, Speed::Low);
         let bl = Output::new(p.PB8, Level::Low, Speed::Low);
-        info!("initializing screen");
         Screen::new(spi1, cs, rst, dc, bl).await.unwrap()
     };
-    info!("done");
 
     screen.set_orientation(Orientation::Portrait).unwrap();
 
     // Do stuff
     const X: usize = 10;
     const Y: usize = 10;
-    const WIDTH: usize = 50;
-    const HEIGHT: usize = 50;
+    const WIDTH: usize = 10;
+    const HEIGHT: usize = 10;
     let mut color = 0_u16;
     let mut pixel_buf = [0_u16; WIDTH * HEIGHT];
 
     screen.enable_backlight();
     loop {
-        info!("main loop");
-        led.set_low();
         color = (color + 1) % 0x0fff;
         pixel_buf.fill(color);
-        info!("drawing to screen");
         screen
             .update_area(X, Y, X + WIDTH, Y + HEIGHT, &pixel_buf)
             .await
             .unwrap();
-        Timer::after_millis(50).await;
 
-        info!("second half");
+        led.set_low();
+        Timer::after_millis(500).await;
+
         led.set_high();
-        /*
-        color = (color + 1) % 0x0fff;
-        pixel_buf.fill(color);
-        info!("drawing to screen");
-        screen
-            .update_area(X, Y, X + WIDTH, Y + HEIGHT, &pixel_buf)
-            .await
-            .unwrap();
-        */
-        Timer::after_millis(50).await;
+        Timer::after_millis(500).await;
 
         /*
         led.set_low();
@@ -131,10 +118,10 @@ async fn main(_spawner: Spawner) {
 
 struct Screen<'d> {
     spi: Spi<'d, Async>,
-    cs: Output<'d>,
-    rst: Output<'d>,
-    dc: Output<'d>,
-    bl: Output<'d>,
+    cs: Output<'d>,  // Chip select
+    rst: Output<'d>, // Reset
+    dc: Output<'d>,  // Data / command
+    bl: Output<'d>,  // Backlight
 
     view_width: usize,
     view_height: usize,
@@ -205,7 +192,7 @@ impl<'d> Screen<'d> {
 
         screen.write_command(EXIT_SLEEP)?;
 
-        Timer::after_millis(50).await;
+        Timer::after_millis(120).await;
 
         screen.write_command(DISPLAY_ON)?;
         screen.deselect();
@@ -339,16 +326,22 @@ impl<'d> Screen<'d> {
             (y1 & 0xff) as u8,
         ];
 
+        info!("col_data = {:?}", col_data);
+        info!("row_data = {:?}", col_data);
+        info!("pixels = {}", pixels.len());
+
         // XXX(RLB) Create a stack-allocated buffer on the fly
-        let mut pixel_buffer = [0_u8; 240 * 320];
+        // XXX(RLB) If this buffer is too big, the stack overflows.
+        let mut pixel_buffer = [0_u8; 200];
         for (i, b) in pixels.iter().map(|b| b.to_be_bytes()).flatten().enumerate() {
             pixel_buffer[i] = b;
         }
 
-        let mut pixel_buffer = &pixel_buffer[..(2 * total_pixels)];
+        let pixel_buffer = &pixel_buffer[..(2 * total_pixels)];
+
+        info!("pixel_buffer {} = {:?}", pixel_buffer.len(), pixel_buffer);
 
         const MAX_CHUNK_SIZE: usize = 1024;
-
         self.select();
 
         // Set the writable area
@@ -360,18 +353,8 @@ impl<'d> Screen<'d> {
 
         self.write_command(WRITE_TO_RAM)?;
 
-        // Tell the ILI9341 that we are going to send data next
-        self.dc.set_high();
-
-        // Write the pixel data
-        // XXX(RLB) Technically this will accept &[16]; maybe we can avoid the above conversion?
-        while !pixel_buffer.is_empty() {
-            let chunk_size = core::cmp::min(pixel_buffer.len(), MAX_CHUNK_SIZE);
-            let (chunk, rest) = pixel_buffer.split_at(chunk_size);
-            pixel_buffer = rest;
-            // XXX(RLB) This line causes a hang and even breaks the debug probe
-            self.spi.blocking_write(chunk)?;
-        }
+        info!("writing!");
+        self.write_data(&pixel_buffer)?;
 
         self.deselect();
 
